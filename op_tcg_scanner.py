@@ -592,6 +592,18 @@ def main():
             except Exception as exc:
                 error_message = f"{type(exc).__name__}: {exc}"
 
+            if code is None:
+                try:
+                    fallback_text = vision_ocr_text(mild_preprocess(roi))
+                    fallback_normalized = normalize_text(fallback_text)
+                    fallback_code = extract_code_from_normalized(fallback_normalized)
+                    if fallback_code:
+                        code = fallback_code
+                        text = fallback_text
+                        normalized_text = fallback_normalized
+                except Exception:
+                    pass
+
             if code:
                 card_payload = fetch_card_info(code)
                 entry = db_by_code.get(code)
