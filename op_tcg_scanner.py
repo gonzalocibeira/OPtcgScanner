@@ -43,13 +43,13 @@ ROI_REL = (0.66, 0.62, 0.26, 0.16)  # (x, y, w, h) in fractions of frame
 
 # Match common One Piece TCG code formats (add more if you need)
 CODE_REGEX = re.compile(
-    r"\b("
+    r"(?<![A-Z0-9])("
     r"OP\d{2}-\d{3}"
     r"|EB\d{2}-\d{3}"
     r"|ST\d{2}-\d{3}"
     r"|PRB\d{2}-\d{3}"
     r"|P-\d{3}"
-    r")\b"
+    r")(?![A-Z0-9])"
 )
 
 
@@ -182,13 +182,14 @@ def extract_code(text: str) -> str | None:
 
     t = text.upper()
 
-    # Remove spaces and normalize separators (OCR often injects spaces)
-    t = t.replace(" ", "").replace("_", "-")
+    # Normalize dash variants globally before any targeted fixes.
+    t = re.sub(r"[‐‑‒–—―−]", "-", t)
+    # Replace separator noise (spaces, underscores, punctuation) with dashes.
+    t = re.sub(r"[\s_]+", "-", t)
+    t = re.sub(r"[^A-Z0-9-]+", "-", t)
 
-    # Common OCR fixes
+    # Common OCR fixes after dash normalization.
     t = t.replace("0P", "OP")  # 0P -> OP
-    t = t.replace("OP—", "OP-").replace("OP–", "OP-").replace("OP−", "OP-")  # weird dashes
-    t = t.replace("EB—", "EB-").replace("ST—", "ST-").replace("PRB—", "PRB-")
 
     m = CODE_REGEX.search(t)
     return m.group(1) if m else None
