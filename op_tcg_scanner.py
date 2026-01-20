@@ -78,9 +78,25 @@ def load_db(path: Path):
             data = json.load(f)
         if isinstance(data, list):
             if all(isinstance(x, dict) and "code" in x for x in data):
-                return data
+                normalized = []
+                for item in data:
+                    quantity = item.get("quantity", 1)
+                    try:
+                        quantity = int(quantity)
+                    except (TypeError, ValueError):
+                        quantity = 1
+                    if quantity < 1:
+                        quantity = 1
+                    normalized.append(
+                        {
+                            "code": item.get("code"),
+                            "card": item.get("card"),
+                            "quantity": quantity,
+                        }
+                    )
+                return normalized
             if all(isinstance(x, str) for x in data):
-                return [{"code": code, "card": None} for code in data]
+                return [{"code": code, "card": None, "quantity": 1} for code in data]
     except Exception:
         pass
     return []
@@ -326,6 +342,12 @@ def main():
 
     out_path = Path(args.out)
     db = load_db(out_path)
+    db_by_code = {
+        entry["code"]: entry
+        for entry in db
+        if isinstance(entry, dict) and entry.get("code")
+    }
+    scan_history = []
     debug_log_path = Path(args.debug_log)
 
     capture = OpenCVCapture(args.camera, args.width, args.height)
@@ -394,9 +416,12 @@ def main():
 
         # Stats
         stats_scale = max(0.7, base_scale)
+        total_quantity = sum(
+            entry.get("quantity", 1) for entry in db if isinstance(entry, dict)
+        )
         cv2.putText(
             frame,
-            f"Scanned: {len(db)}",
+            f"Scanned (total): {total_quantity}",
             (20, 40),
             cv2.FONT_HERSHEY_SIMPLEX,
             stats_scale,
@@ -481,13 +506,20 @@ def main():
             break
 
         if key == ord("d"):  # undo last
-            if db:
-                removed = db.pop()
-                atomic_write_json(out_path, db)
-                removed_code = removed.get("code") if isinstance(removed, dict) else str(removed)
-                flash_text = f"UNDO: {removed_code}"
-                flash_ok = True
-                flash_until = time.time() + 1.0
+            if scan_history:
+                removed_code = scan_history.pop()
+                entry = db_by_code.get(removed_code)
+                if entry:
+                    quantity = entry.get("quantity", 1)
+                    if quantity > 1:
+                        entry["quantity"] = quantity - 1
+                    else:
+                        db.remove(entry)
+                        db_by_code.pop(removed_code, None)
+                    atomic_write_json(out_path, db)
+                    flash_text = f"UNDO: {removed_code}"
+                    flash_ok = True
+                    flash_until = time.time() + 1.0
 
         move_step = max(2, int(min(w, h) * 0.01))
         size_step = max(2, int(min(w, h) * 0.005))
@@ -545,7 +577,16 @@ def main():
 
             if code:
                 card_payload = fetch_card_info(code)
-                db.append({"code": code, "card": card_payload})
+                entry = db_by_code.get(code)
+                if entry:
+                    entry["quantity"] = entry.get("quantity", 1) + 1
+                    if entry.get("card") is None and card_payload is not None:
+                        entry["card"] = card_payload
+                else:
+                    entry = {"code": code, "card": card_payload, "quantity": 1}
+                    db.append(entry)
+                    db_by_code[code] = entry
+                scan_history.append(code)
                 atomic_write_json(out_path, db)
                 flash_text = code
                 flash_ok = True
