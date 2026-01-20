@@ -253,7 +253,7 @@ def main():
     capture = OpenCVCapture(args.camera, args.width, args.height)
 
     win = ("OP TCG Scanner (Space/Enter=Scan, D=Undo, Q/Esc=Quit, "
-           "ROI: Arrows/WASD move, +/- width, [/] height, R reset)")
+           "ROI: Arrows/WASD move, +/- width, ,/. height, R reset)")
     cv2.namedWindow(win, cv2.WINDOW_NORMAL)
 
     flash_until = 0.0
@@ -304,7 +304,7 @@ def main():
         )
         cv2.putText(
             frame,
-            "ROI: Move=Arrows/WASD  Width=+/-  Height=[/]",
+            "ROI: Move=Arrows/WASD  Width=+/-  Height=,/.",
             (20, h - 60),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.7,
@@ -388,10 +388,10 @@ def main():
         if key in (ord("-"), ord("_")):
             nx, ny, nrw, nrh = compute_roi(w, h, roi_px=(x, y, rw - size_step, rh))
             roi_rel_state = (nx / w, ny / h, nrw / w, nrh / h)
-        if key == ord("]"):
+        if key == ord("."):
             nx, ny, nrw, nrh = compute_roi(w, h, roi_px=(x, y, rw, rh + size_step))
             roi_rel_state = (nx / w, ny / h, nrw / w, nrh / h)
-        if key == ord("["):
+        if key == ord(","):
             nx, ny, nrw, nrh = compute_roi(w, h, roi_px=(x, y, rw, rh - size_step))
             roi_rel_state = (nx / w, ny / h, nrw / w, nrh / h)
         if key == ord("r"):
