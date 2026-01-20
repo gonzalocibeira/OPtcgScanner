@@ -234,7 +234,26 @@ def extract_code_from_normalized(normalized: str) -> str | None:
         return None
 
     m = CODE_REGEX.search(normalized)
-    return m.group(1) if m else None
+    if m:
+        return m.group(1)
+
+    candidate_regex = re.compile(
+        r"(?:(OP|EB|ST|PRB)([0-9OISBLD]{2})-([0-9OISBLD]{3})|P-([0-9OISBLD]{3}))"
+    )
+    correction_map = str.maketrans({"O": "0", "I": "1", "L": "1", "S": "5", "B": "8", "D": "0"})
+
+    for match in candidate_regex.finditer(normalized):
+        if match.group(1):
+            set_prefix, set_num, card_num = match.group(1), match.group(2), match.group(3)
+            corrected = f"{set_prefix}{set_num.translate(correction_map)}-{card_num.translate(correction_map)}"
+        else:
+            corrected = f"P-{match.group(4).translate(correction_map)}"
+
+        strict_match = CODE_REGEX.search(corrected)
+        if strict_match:
+            return strict_match.group(1)
+
+    return None
 
 
 def mild_preprocess(roi_bgr: np.ndarray) -> np.ndarray:
