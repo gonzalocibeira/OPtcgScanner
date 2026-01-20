@@ -42,7 +42,8 @@ import Vision
 ROI_REL = (0.66, 0.62, 0.26, 0.16)  # (x, y, w, h) in fractions of frame
 
 
-# Match common One Piece TCG code formats (add more if you need)
+# Match common One Piece TCG code formats (add more if you need).
+# Tolerate suffix letters (e.g., OP09-071A) but strip them from the match.
 CODE_REGEX = re.compile(
     r"(?<![A-Z0-9])("
     r"OP\d{2}-\d{3}"
@@ -50,7 +51,7 @@ CODE_REGEX = re.compile(
     r"|ST\d{2}-\d{3}"
     r"|PRB\d{2}-\d{3}"
     r"|P-\d{3}"
-    r")(?![A-Z0-9])"
+    r")(?=[A-Z]?[^A-Z0-9]|$)"
 )
 
 
