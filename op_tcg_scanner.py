@@ -1,4 +1,23 @@
 #!/usr/bin/env python3
+"""
+OP TCG Card Code Scanner (macOS)
+- OpenCV camera preview + fixed ROI guide box
+- Press Space/Enter to scan ROI with Apple Vision OCR
+- Saves ONLY card codes to JSON (list of strings)
+- Shows SCAN OK + code for 1 second
+
+Python: 3.10+ (recommended 3.11/3.12)
+Install:
+  python3 -m venv .venv
+  source .venv/bin/activate
+  python -m pip install --upgrade pip setuptools wheel
+  python -m pip install opencv-python pyobjc pyobjc-framework-Vision pyobjc-framework-Quartz
+
+Run:
+  python op_tcg_scanner.py --camera 0 --out cards.json
+  (try --camera 1,2... if using iPhone Continuity Camera)
+"""
+
 import argparse
 import json
 import os
@@ -9,25 +28,19 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-# Apple Vision OCR (macOS)
 import Quartz
 import Vision
 
 
 # ----------------------------
-# Config: fixed ROI (relative)
+# Fixed ROI (relative to frame)
 # ----------------------------
-# ROI is a rectangle where you will place the card code area (bottom-right of the card).
-# Format: (x, y, w, h) as fractions of frame width/height.
-# Tweak these once you see the preview.
-ROI_REL = (0.58, 0.68, 0.40, 0.30)
-
-# OCR stability helpers
-MIN_CODE_LEN = 7  # e.g., OP05-043 is 8, but keep small guard
+# Put the card's bottom-right corner (with the code) inside this box.
+# Tuned vs your screenshot (moves ROI up and makes it smaller).
+ROI_REL = (0.60, 0.58, 0.36, 0.22)  # (x, y, w, h) in fractions of frame
 
 
-# Match common One Piece TCG code formats:
-# OPxx-xxx, EBxx-xxx, STxx-xxx, PRBxx-xxx, P-xxx (promos)
+# Match common One Piece TCG code formats (add more if you need)
 CODE_REGEX = re.compile(
     r"\b("
     r"OP\d{2}-\d{3}"
@@ -56,36 +69,44 @@ def load_db(path: Path):
             return data
     except Exception:
         pass
-    # If file is invalid, don’t destroy it; start fresh in-memory.
     return []
+
+
+def compute_roi(frame_w: int, frame_h: int):
+    rx, ry, rw, rh = ROI_REL
+    x = int(frame_w * rx)
+    y = int(frame_h * ry)
+    w = int(frame_w * rw)
+    h = int(frame_h * rh)
+
+    x = max(0, min(x, frame_w - 2))
+    y = max(0, min(y, frame_h - 2))
+    w = max(2, min(w, frame_w - x))
+    h = max(2, min(h, frame_h - y))
+    return x, y, w, h
 
 
 def np_bgr_to_cgimage(bgr: np.ndarray):
     """
-    Convert a BGR OpenCV image to a CGImage for Vision.
+    Vision is happiest with BGRA 32bpp + proper bitmap flags.
     """
-    rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-    h, w, _ = rgb.shape
-    bytes_per_row = w * 3
+    bgra = cv2.cvtColor(bgr, cv2.COLOR_BGR2BGRA)
+    h, w = bgra.shape[:2]
+    bytes_per_row = w * 4
+    data = bgra.tobytes()
 
-    data_provider = Quartz.CGDataProviderCreateWithData(
-        None,
-        rgb.tobytes(),
-        len(rgb.tobytes()),
-        None
-    )
-
-    color_space = Quartz.CGColorSpaceCreateDeviceRGB()
-    bitmap_info = Quartz.kCGBitmapByteOrderDefault
+    provider = Quartz.CGDataProviderCreateWithData(None, data, len(data), None)
+    cs = Quartz.CGColorSpaceCreateDeviceRGB()
+    bitmap_info = (Quartz.kCGBitmapByteOrder32Little |
+                   Quartz.kCGImageAlphaPremultipliedFirst)
 
     cgimage = Quartz.CGImageCreate(
-        w, h,                 # width, height
-        8,                    # bits per component
-        24,                   # bits per pixel
+        w, h,
+        8, 32,
         bytes_per_row,
-        color_space,
+        cs,
         bitmap_info,
-        data_provider,
+        provider,
         None,
         False,
         Quartz.kCGRenderingIntentDefault
@@ -93,21 +114,15 @@ def np_bgr_to_cgimage(bgr: np.ndarray):
     return cgimage
 
 
-def vision_ocr_text(bgr_roi: np.ndarray) -> str:
-    """
-    Run Apple Vision text recognition on an image ROI (BGR ndarray).
-    Returns raw recognized text (joined lines).
-    """
-    cgimage = np_bgr_to_cgimage(bgr_roi)
-    handler = Vision.VNImageRequestHandler.alloc().initWithCGImage_options_(cgimage, None)
+def vision_ocr_text(bgr_img: np.ndarray) -> str:
+    cgimage = np_bgr_to_cgimage(bgr_img)
 
+    handler = Vision.VNImageRequestHandler.alloc().initWithCGImage_options_(cgimage, None)
     request = Vision.VNRecognizeTextRequest.alloc().init()
-    # Accuracy vs speed: accurate is better for small card text
     request.setRecognitionLevel_(Vision.VNRequestTextRecognitionLevelAccurate)
     request.setUsesLanguageCorrection_(False)
-    # If your OS supports it, you can hint languages; English is fine for alphanumerics.
 
-    ok, err = handler.performRequests_error_([request], None)
+    ok, _err = handler.performRequests_error_([request], None)
     if not ok:
         return ""
 
@@ -123,66 +138,37 @@ def vision_ocr_text(bgr_roi: np.ndarray) -> str:
 
 
 def extract_code(text: str) -> str | None:
-    """
-    Extract first valid code from OCR text using regex.
-    Also normalizes common OCR confusion (O/0, I/1) lightly.
-    """
-    if not text or len(text) < MIN_CODE_LEN:
+    if not text:
         return None
 
-    # Normalize: remove spaces, common separators
-    t = text.upper().replace(" ", "").replace("_", "-")
+    t = text.upper()
 
-    # Some OCRs read OP as 0P or O P; do light fixes
-    t = t.replace("0P", "OP").replace("O P", "OP").replace("OP-", "OP")
-    t = t.replace("EB-", "EB").replace("ST-", "ST").replace("PRB-", "PRB")
+    # Remove spaces and normalize separators (OCR often injects spaces)
+    t = t.replace(" ", "").replace("_", "-")
+
+    # Common OCR fixes
+    t = t.replace("0P", "OP")  # 0P -> OP
+    t = t.replace("OP—", "OP-").replace("OP–", "OP-").replace("OP−", "OP-")  # weird dashes
+    t = t.replace("EB—", "EB-").replace("ST—", "ST-").replace("PRB—", "PRB-")
 
     m = CODE_REGEX.search(t)
     return m.group(1) if m else None
 
 
-def compute_roi(frame_w: int, frame_h: int, roi_rel):
-    rx, ry, rw, rh = roi_rel
-    x = int(frame_w * rx)
-    y = int(frame_h * ry)
-    w = int(frame_w * rw)
-    h = int(frame_h * rh)
-    # clamp
-    x = max(0, min(x, frame_w - 1))
-    y = max(0, min(y, frame_h - 1))
-    w = max(1, min(w, frame_w - x))
-    h = max(1, min(h, frame_h - y))
-    return x, y, w, h
-
-
-def preprocess_for_ocr(roi_bgr: np.ndarray) -> np.ndarray:
+def mild_preprocess(roi_bgr: np.ndarray) -> np.ndarray:
     """
-    Preprocess ROI to improve OCR:
-    - grayscale
-    - resize up
-    - contrast
-    - adaptive threshold
-    Then return as BGR (Vision accepts any image, but this helps).
+    Mild preprocessing (safe for Vision): upscale + light contrast.
+    Avoid heavy thresholding unless you really need it.
     """
-    gray = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2GRAY)
+    scale = 2.0
+    up = cv2.resize(roi_bgr, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
 
-    # Upscale (helps small text)
-    scale = 2.5
-    gray = cv2.resize(gray, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
-
-    # Contrast
-    gray = cv2.normalize(gray, None, 0, 255, cv2.NORM_MINMAX)
-
-    # Adaptive threshold (robust to lighting)
-    thr = cv2.adaptiveThreshold(
-        gray, 255,
-        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-        cv2.THRESH_BINARY,
-        31, 10
-    )
-
-    # Convert back to BGR
-    return cv2.cvtColor(thr, cv2.COLOR_GRAY2BGR)
+    lab = cv2.cvtColor(up, cv2.COLOR_BGR2LAB)
+    l, a, b = cv2.split(lab)
+    l = cv2.equalizeHist(l)
+    lab = cv2.merge([l, a, b])
+    out = cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
+    return out
 
 
 def main():
@@ -191,20 +177,8 @@ def main():
     ap.add_argument("--out", type=str, default="cards.json", help="Output JSON path")
     ap.add_argument("--width", type=int, default=1280, help="Requested capture width")
     ap.add_argument("--height", type=int, default=720, help="Requested capture height")
-    ap.add_argument("--roi-x", type=float, default=ROI_REL[0], help="ROI x (relative 0-1)")
-    ap.add_argument("--roi-y", type=float, default=ROI_REL[1], help="ROI y (relative 0-1)")
-    ap.add_argument("--roi-w", type=float, default=ROI_REL[2], help="ROI width (relative 0-1)")
-    ap.add_argument("--roi-h", type=float, default=ROI_REL[3], help="ROI height (relative 0-1)")
+    ap.add_argument("--preprocess", action="store_true", help="Enable mild preprocessing before OCR")
     args = ap.parse_args()
-
-    roi_rel = (args.roi_x, args.roi_y, args.roi_w, args.roi_h)
-    rx, ry, rw, rh = roi_rel
-    if not (0 <= rx <= 1 and 0 <= ry <= 1):
-        ap.error("--roi-x and --roi-y must be between 0 and 1.")
-    if not (0 < rw <= 1 and 0 < rh <= 1):
-        ap.error("--roi-w and --roi-h must be > 0 and <= 1.")
-    if rx + rw > 1 or ry + rh > 1:
-        ap.error("--roi-x + --roi-w and --roi-y + --roi-h must be <= 1.")
 
     out_path = Path(args.out)
     db = load_db(out_path)
@@ -231,16 +205,16 @@ def main():
             continue
 
         h, w = frame.shape[:2]
-        x, y, rw, rh = compute_roi(w, h, roi_rel)
+        x, y, rw, rh = compute_roi(w, h)
 
-        # Draw guide ROI
+        # ROI guide box
         cv2.rectangle(frame, (x, y), (x + rw, y + rh), (255, 255, 255), 2)
         cv2.putText(
             frame,
-            "Place card code here",
-            (x, max(20, y - 10)),
+            "Put card code inside this box",
+            (x, max(30, y - 10)),
             cv2.FONT_HERSHEY_SIMPLEX,
-            0.7,
+            0.8,
             (255, 255, 255),
             2,
             cv2.LINE_AA
@@ -261,11 +235,10 @@ def main():
         # Flash overlay
         now = time.time()
         if now < flash_until:
-            msg = flash_text
             color = (0, 255, 0) if flash_ok else (0, 0, 255)
             cv2.putText(
                 frame,
-                msg,
+                flash_text,
                 (20, 100),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 1.2,
@@ -276,7 +249,7 @@ def main():
             cv2.putText(
                 frame,
                 "SCAN OK" if flash_ok else "SCAN FAIL",
-                (20, 140),
+                (20, 145),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 1.0,
                 color,
@@ -290,7 +263,7 @@ def main():
         if key in (27, ord("q")):  # Esc or q
             break
 
-        if key in (ord("d"),):  # undo last
+        if key == ord("d"):  # undo last
             if db:
                 removed = db.pop()
                 atomic_write_json(out_path, db)
@@ -298,17 +271,16 @@ def main():
                 flash_ok = True
                 flash_until = time.time() + 1.0
 
-        if key in (13, 32):  # Enter or Space = scan
-            # Simple debounce
+        if key in (13, 32):  # Enter or Space
             if time.time() - last_scan_time < 0.25:
                 continue
             last_scan_time = time.time()
 
             roi = frame[y:y + rh, x:x + rw].copy()
-            pre = preprocess_for_ocr(roi)
+            img_for_ocr = mild_preprocess(roi) if args.preprocess else roi
 
             try:
-                text = vision_ocr_text(pre)
+                text = vision_ocr_text(img_for_ocr)
                 code = extract_code(text)
             except Exception:
                 code = None
@@ -320,7 +292,9 @@ def main():
                 flash_ok = True
                 flash_until = time.time() + 1.0
             else:
-                flash_text = "No code detected"
+                # Useful hint: show what Vision saw (short)
+                short = (text.replace("\n", " ")[:40] + "...") if text else "No text"
+                flash_text = f"No code ({short})"
                 flash_ok = False
                 flash_until = time.time() + 1.0
 
