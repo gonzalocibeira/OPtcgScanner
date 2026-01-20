@@ -254,6 +254,29 @@ def fetch_card_info(code: str) -> dict | None:
     return None
 
 
+def get_text_size(text: str, font, scale: float, thickness: int) -> tuple[int, int, int]:
+    (text_w, text_h), baseline = cv2.getTextSize(text, font, scale, thickness)
+    return text_w, text_h, baseline
+
+
+def clamp_text_origin(
+    origin_x: int,
+    origin_y: int,
+    text_w: int,
+    text_h: int,
+    frame_w: int,
+    frame_h: int,
+    padding: int = 2,
+) -> tuple[int, int]:
+    min_x = padding
+    max_x = max(padding, frame_w - text_w - padding)
+    min_y = text_h + padding
+    max_y = max(min_y, frame_h - padding)
+    clamped_x = max(min_x, min(origin_x, max_x))
+    clamped_y = max(min_y, min(origin_y, max_y))
+    return clamped_x, clamped_y
+
+
 class OpenCVCapture:
     def __init__(self, camera_index: int, width: int, height: int):
         self.cap = cv2.VideoCapture(camera_index)
@@ -326,6 +349,7 @@ def main():
             continue
 
         h, w = frame.shape[:2]
+        base_scale = max(0.6, min(1.0, min(w / 1280, h / 720)))
         if not roi_initialized and roi_px_pending is not None:
             rx, ry, rw, rh = compute_roi(w, h, roi_px=roi_px_pending)
             roi_rel_state = (rx / w, ry / h, rw / w, rh / h)
@@ -335,48 +359,95 @@ def main():
 
         # ROI guide box
         cv2.rectangle(frame, (x, y), (x + rw, y + rh), (255, 255, 255), 2)
+        hint_text = "Put card code inside this small box"
+        hint_font = cv2.FONT_HERSHEY_SIMPLEX
+        hint_scale = max(0.5, min(0.9, base_scale * 0.85))
+        hint_thickness = 2
+        hint_pad = 6
+        hint_w, hint_h, _ = get_text_size(hint_text, hint_font, hint_scale, hint_thickness)
+        if hint_w + hint_pad * 2 <= rw and hint_h + hint_pad * 2 <= rh:
+            hint_origin = (x + hint_pad, y + hint_pad + hint_h)
+        else:
+            if y - hint_pad - hint_h >= 0:
+                hint_origin = (x, y - hint_pad)
+            else:
+                hint_origin = (x, y + rh + hint_pad + hint_h)
+        hint_origin = clamp_text_origin(
+            hint_origin[0],
+            hint_origin[1],
+            hint_w,
+            hint_h,
+            w,
+            h,
+            padding=hint_pad,
+        )
         cv2.putText(
             frame,
-            "Put card code inside this small box",
-            (x, max(30, y - 10)),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.8,
+            hint_text,
+            hint_origin,
+            hint_font,
+            hint_scale,
             (255, 255, 255),
-            2,
+            hint_thickness,
             cv2.LINE_AA
         )
 
         # Stats
+        stats_scale = max(0.7, base_scale)
         cv2.putText(
             frame,
             f"Scanned: {len(db)}",
             (20, 40),
             cv2.FONT_HERSHEY_SIMPLEX,
-            1.0,
+            stats_scale,
             (255, 255, 255),
             2,
             cv2.LINE_AA
         )
-        cv2.putText(
-            frame,
-            "ROI: Move=Arrows/WASD  Width=+/-  Height=,/.",
-            (20, h - 60),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.7,
-            (255, 255, 255),
-            2,
-            cv2.LINE_AA
-        )
-        cv2.putText(
-            frame,
-            "R=Reset ROI",
-            (20, h - 30),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.7,
-            (255, 255, 255),
-            2,
-            cv2.LINE_AA
-        )
+        hud_font = cv2.FONT_HERSHEY_SIMPLEX
+        if h < 520:
+            hud_scale = max(0.45, base_scale * 0.55)
+            hud_line = "ROI: Move=Arrows/WASD  Width=+/-  Height=,/.  R=Reset ROI"
+            hud_w, hud_h, _ = get_text_size(hud_line, hud_font, hud_scale, 2)
+            hud_origin = clamp_text_origin(20, h - 20, hud_w, hud_h, w, h, padding=10)
+            cv2.putText(
+                frame,
+                hud_line,
+                hud_origin,
+                hud_font,
+                hud_scale,
+                (255, 255, 255),
+                2,
+                cv2.LINE_AA
+            )
+        else:
+            hud_scale = max(0.6, base_scale * 0.7)
+            hud_line_1 = "ROI: Move=Arrows/WASD  Width=+/-  Height=,/."
+            hud_line_2 = "R=Reset ROI"
+            hud_w1, hud_h1, _ = get_text_size(hud_line_1, hud_font, hud_scale, 2)
+            hud_w2, hud_h2, _ = get_text_size(hud_line_2, hud_font, hud_scale, 2)
+            hud_origin_1 = clamp_text_origin(20, h - 60, hud_w1, hud_h1, w, h, padding=10)
+            hud_origin_2 = clamp_text_origin(20, h - 30, hud_w2, hud_h2, w, h, padding=10)
+            cv2.putText(
+                frame,
+                hud_line_1,
+                hud_origin_1,
+                hud_font,
+                hud_scale,
+                (255, 255, 255),
+                2,
+                cv2.LINE_AA
+            )
+            cv2.putText(
+                frame,
+                hud_line_2,
+                hud_origin_2,
+                hud_font,
+                hud_scale,
+                (255, 255, 255),
+                2,
+                cv2.LINE_AA
+            )
 
         # Flash overlay
         now = time.time()
