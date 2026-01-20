@@ -141,8 +141,8 @@ def extract_code(text: str) -> str | None:
     return m.group(1) if m else None
 
 
-def compute_roi(frame_w: int, frame_h: int):
-    rx, ry, rw, rh = ROI_REL
+def compute_roi(frame_w: int, frame_h: int, roi_rel):
+    rx, ry, rw, rh = roi_rel
     x = int(frame_w * rx)
     y = int(frame_h * ry)
     w = int(frame_w * rw)
@@ -191,7 +191,20 @@ def main():
     ap.add_argument("--out", type=str, default="cards.json", help="Output JSON path")
     ap.add_argument("--width", type=int, default=1280, help="Requested capture width")
     ap.add_argument("--height", type=int, default=720, help="Requested capture height")
+    ap.add_argument("--roi-x", type=float, default=ROI_REL[0], help="ROI x (relative 0-1)")
+    ap.add_argument("--roi-y", type=float, default=ROI_REL[1], help="ROI y (relative 0-1)")
+    ap.add_argument("--roi-w", type=float, default=ROI_REL[2], help="ROI width (relative 0-1)")
+    ap.add_argument("--roi-h", type=float, default=ROI_REL[3], help="ROI height (relative 0-1)")
     args = ap.parse_args()
+
+    roi_rel = (args.roi_x, args.roi_y, args.roi_w, args.roi_h)
+    rx, ry, rw, rh = roi_rel
+    if not (0 <= rx <= 1 and 0 <= ry <= 1):
+        ap.error("--roi-x and --roi-y must be between 0 and 1.")
+    if not (0 < rw <= 1 and 0 < rh <= 1):
+        ap.error("--roi-w and --roi-h must be > 0 and <= 1.")
+    if rx + rw > 1 or ry + rh > 1:
+        ap.error("--roi-x + --roi-w and --roi-y + --roi-h must be <= 1.")
 
     out_path = Path(args.out)
     db = load_db(out_path)
@@ -218,7 +231,7 @@ def main():
             continue
 
         h, w = frame.shape[:2]
-        x, y, rw, rh = compute_roi(w, h)
+        x, y, rw, rh = compute_roi(w, h, roi_rel)
 
         # Draw guide ROI
         cv2.rectangle(frame, (x, y), (x + rw, y + rh), (255, 255, 255), 2)
