@@ -24,6 +24,7 @@ import ctypes
 import importlib
 import importlib.util
 import json
+import math
 import os
 import re
 import threading
@@ -42,7 +43,7 @@ import Vision
 # ----------------------------
 # Put the card's bottom-right corner (with the code) inside this box.
 # Tuned vs your screenshot (moves ROI up and makes it smaller).
-ROI_REL = (0.60, 0.58, 0.36, 0.22)  # (x, y, w, h) in fractions of frame
+ROI_REL = (0.66, 0.62, 0.26, 0.16)  # (x, y, w, h) in fractions of frame
 
 
 # Match common One Piece TCG code formats (add more if you need)
@@ -77,12 +78,50 @@ def load_db(path: Path):
     return []
 
 
-def compute_roi(frame_w: int, frame_h: int):
-    rx, ry, rw, rh = ROI_REL
-    x = int(frame_w * rx)
-    y = int(frame_h * ry)
-    w = int(frame_w * rw)
-    h = int(frame_h * rh)
+def parse_roi_rel(value: str) -> tuple[float, float, float, float]:
+    parts = [p.strip() for p in value.split(",")]
+    if len(parts) != 4:
+        raise argparse.ArgumentTypeError("ROI must be x,y,w,h with 4 comma-separated values.")
+    try:
+        nums = [float(p) for p in parts]
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("ROI fractions must be numeric.") from exc
+    if not all(math.isfinite(n) for n in nums):
+        raise argparse.ArgumentTypeError("ROI fractions must be finite numbers.")
+    x, y, w, h = nums
+    if not (0.0 <= x <= 1.0 and 0.0 <= y <= 1.0 and 0.0 < w <= 1.0 and 0.0 < h <= 1.0):
+        raise argparse.ArgumentTypeError("ROI fractions must be within 0-1, with w/h > 0.")
+    return x, y, w, h
+
+
+def parse_roi_px(value: str) -> tuple[int, int, int, int]:
+    parts = [p.strip() for p in value.split(",")]
+    if len(parts) != 4:
+        raise argparse.ArgumentTypeError("ROI pixels must be x,y,w,h with 4 comma-separated values.")
+    try:
+        nums = [int(p) for p in parts]
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("ROI pixels must be integers.") from exc
+    x, y, w, h = nums
+    if x < 0 or y < 0 or w <= 0 or h <= 0:
+        raise argparse.ArgumentTypeError("ROI pixels must be >= 0 with w/h > 0.")
+    return x, y, w, h
+
+
+def compute_roi(
+    frame_w: int,
+    frame_h: int,
+    roi_rel: tuple[float, float, float, float] | None = None,
+    roi_px: tuple[int, int, int, int] | None = None,
+):
+    if roi_px is not None:
+        x, y, w, h = roi_px
+    else:
+        rx, ry, rw, rh = roi_rel if roi_rel is not None else ROI_REL
+        x = int(frame_w * rx)
+        y = int(frame_h * ry)
+        w = int(frame_w * rw)
+        h = int(frame_h * rh)
 
     x = max(0, min(x, frame_w - 2))
     y = max(0, min(y, frame_h - 2))
@@ -363,6 +402,16 @@ def main():
         default=1.0,
         help="AVFoundation zoom factor (1.0 = no zoom)",
     )
+    ap.add_argument(
+        "--roi",
+        type=parse_roi_rel,
+        help="ROI as fractions x,y,w,h (0-1). Overrides default guide box.",
+    )
+    ap.add_argument(
+        "--roi-px",
+        type=parse_roi_px,
+        help="ROI in pixels x,y,w,h. Overrides --roi and default guide box.",
+    )
     ap.add_argument("--preprocess", action="store_true", help="Enable mild preprocessing before OCR")
     args = ap.parse_args()
 
@@ -386,13 +435,13 @@ def main():
             continue
 
         h, w = frame.shape[:2]
-        x, y, rw, rh = compute_roi(w, h)
+        x, y, rw, rh = compute_roi(w, h, args.roi, args.roi_px)
 
         # ROI guide box
         cv2.rectangle(frame, (x, y), (x + rw, y + rh), (255, 255, 255), 2)
         cv2.putText(
             frame,
-            "Put card code inside this box",
+            "Put card code inside this small box",
             (x, max(30, y - 10)),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.8,
