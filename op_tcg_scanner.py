@@ -221,6 +221,8 @@ def normalize_text(text: str) -> str:
     # Replace separator noise (spaces, underscores, punctuation) with dashes.
     normalized = re.sub(r"[\s_]+", "-", normalized)
     normalized = re.sub(r"[^A-Z0-9-]+", "-", normalized)
+    # Insert missing dashes before set prefixes when glued to prior alphanumerics.
+    normalized = re.sub(r"([A-Z0-9])(OP|EB|ST|PRB|P-)", r"\1-\2", normalized)
 
     # Common OCR fixes after dash normalization.
     normalized = normalized.replace("0P", "OP")  # 0P -> OP
