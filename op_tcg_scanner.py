@@ -251,7 +251,8 @@ def main():
 
     capture = OpenCVCapture(args.camera, args.width, args.height)
 
-    win = "OP TCG Scanner (Space/Enter=Scan, D=Undo, Q/Esc=Quit)"
+    win = ("OP TCG Scanner (Space/Enter=Scan, D=Undo, Q/Esc=Quit, "
+           "ROI: Arrows/WASD move, +/- width, [/] height, R reset)")
     cv2.namedWindow(win, cv2.WINDOW_NORMAL)
 
     flash_until = 0.0
@@ -259,6 +260,9 @@ def main():
     flash_ok = False
 
     last_scan_time = 0.0
+    roi_rel_state = args.roi if args.roi is not None else ROI_REL
+    roi_px_pending = args.roi_px
+    roi_initialized = roi_px_pending is None
 
     while True:
         ok, frame = capture.read()
@@ -266,7 +270,12 @@ def main():
             continue
 
         h, w = frame.shape[:2]
-        x, y, rw, rh = compute_roi(w, h, args.roi, args.roi_px)
+        if not roi_initialized and roi_px_pending is not None:
+            rx, ry, rw, rh = compute_roi(w, h, roi_px=roi_px_pending)
+            roi_rel_state = (rx / w, ry / h, rw / w, rh / h)
+            roi_initialized = True
+
+        x, y, rw, rh = compute_roi(w, h, roi_rel=roi_rel_state)
 
         # ROI guide box
         cv2.rectangle(frame, (x, y), (x + rw, y + rh), (255, 255, 255), 2)
@@ -288,6 +297,26 @@ def main():
             (20, 40),
             cv2.FONT_HERSHEY_SIMPLEX,
             1.0,
+            (255, 255, 255),
+            2,
+            cv2.LINE_AA
+        )
+        cv2.putText(
+            frame,
+            "ROI: Move=Arrows/WASD  Width=+/-  Height=[/]",
+            (20, h - 60),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.7,
+            (255, 255, 255),
+            2,
+            cv2.LINE_AA
+        )
+        cv2.putText(
+            frame,
+            "R=Reset ROI",
+            (20, h - 30),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.7,
             (255, 255, 255),
             2,
             cv2.LINE_AA
@@ -331,6 +360,41 @@ def main():
                 flash_text = f"UNDO: {removed}"
                 flash_ok = True
                 flash_until = time.time() + 1.0
+
+        move_step = max(2, int(min(w, h) * 0.01))
+        size_step = max(2, int(min(w, h) * 0.005))
+        move_map = {
+            ord("a"): (-1, 0),
+            ord("d"): (1, 0),
+            ord("w"): (0, -1),
+            ord("s"): (0, 1),
+            81: (-1, 0),  # Left arrow
+            82: (0, -1),  # Up arrow
+            83: (1, 0),   # Right arrow
+            84: (0, 1),   # Down arrow
+        }
+
+        if key in move_map:
+            dx, dy = move_map[key]
+            nx = x + dx * move_step
+            ny = y + dy * move_step
+            nx, ny, nrw, nrh = compute_roi(w, h, roi_px=(nx, ny, rw, rh))
+            roi_rel_state = (nx / w, ny / h, nrw / w, nrh / h)
+
+        if key in (ord("+"), ord("=")):
+            nx, ny, nrw, nrh = compute_roi(w, h, roi_px=(x, y, rw + size_step, rh))
+            roi_rel_state = (nx / w, ny / h, nrw / w, nrh / h)
+        if key in (ord("-"), ord("_")):
+            nx, ny, nrw, nrh = compute_roi(w, h, roi_px=(x, y, rw - size_step, rh))
+            roi_rel_state = (nx / w, ny / h, nrw / w, nrh / h)
+        if key == ord("]"):
+            nx, ny, nrw, nrh = compute_roi(w, h, roi_px=(x, y, rw, rh + size_step))
+            roi_rel_state = (nx / w, ny / h, nrw / w, nrh / h)
+        if key == ord("["):
+            nx, ny, nrw, nrh = compute_roi(w, h, roi_px=(x, y, rw, rh - size_step))
+            roi_rel_state = (nx / w, ny / h, nrw / w, nrh / h)
+        if key == ord("r"):
+            roi_rel_state = ROI_REL
 
         if key in (13, 32):  # Enter or Space
             if time.time() - last_scan_time < 0.25:
