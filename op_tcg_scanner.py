@@ -432,7 +432,7 @@ def main():
         hud_font = cv2.FONT_HERSHEY_SIMPLEX
         if h < 520:
             hud_scale = max(0.45, base_scale * 0.55)
-            hud_line = "ROI: Move=Arrows/WASD  Width=+/-  Height=,/.  R=Reset ROI"
+            hud_line = "ROI: Move=Arrows  Width=+/-  Height=,/.  R=Reset ROI"
             hud_w, hud_h, _ = get_text_size(hud_line, hud_font, hud_scale, 2)
             hud_origin = clamp_text_origin(20, h - 20, hud_w, hud_h, w, h, padding=10)
             cv2.putText(
@@ -447,7 +447,7 @@ def main():
             )
         else:
             hud_scale = max(0.6, base_scale * 0.7)
-            hud_line_1 = "ROI: Move=Arrows/WASD  Width=+/-  Height=,/."
+            hud_line_1 = "ROI: Move=Arrows  Width=+/-  Height=,/."
             hud_line_2 = "R=Reset ROI"
             hud_w1, hud_h1, _ = get_text_size(hud_line_1, hud_font, hud_scale, 2)
             hud_w2, hud_h2, _ = get_text_size(hud_line_2, hud_font, hud_scale, 2)
@@ -524,10 +524,6 @@ def main():
         move_step = max(2, int(min(w, h) * 0.01))
         size_step = max(2, int(min(w, h) * 0.005))
         move_map = {
-            ord("a"): (-1, 0),
-            ord("d"): (1, 0),
-            ord("w"): (0, -1),
-            ord("s"): (0, 1),
             81: (-1, 0),  # Left arrow
             82: (0, -1),  # Up arrow
             83: (1, 0),   # Right arrow
