@@ -3,7 +3,7 @@
 OP TCG Card Code Scanner (macOS)
 - OpenCV camera preview + fixed ROI guide box
 - Press Space/Enter to scan ROI with Apple Vision OCR
-- Saves ONLY card codes to JSON (list of strings)
+- Saves card codes + card payloads to JSON (list of dicts)
 - Shows SCAN OK + code for 1 second
 
 Python: 3.10+ (recommended 3.11/3.12)
@@ -25,6 +25,7 @@ import os
 import re
 import time
 from pathlib import Path
+from urllib import request
 
 import cv2
 import numpy as np
@@ -66,8 +67,11 @@ def load_db(path: Path):
     try:
         with path.open("r", encoding="utf-8") as f:
             data = json.load(f)
-        if isinstance(data, list) and all(isinstance(x, str) for x in data):
-            return data
+        if isinstance(data, list):
+            if all(isinstance(x, dict) and "code" in x for x in data):
+                return data
+            if all(isinstance(x, str) for x in data):
+                return [{"code": code, "card": None} for code in data]
     except Exception:
         pass
     return []
@@ -209,6 +213,25 @@ def mild_preprocess(roi_bgr: np.ndarray) -> np.ndarray:
     lab = cv2.merge([l, a, b])
     out = cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
     return out
+
+
+def fetch_card_info(code: str) -> dict | None:
+    card_set_id = code.strip()
+    if not card_set_id:
+        return None
+
+    url = f"https://www.optcgapi.com/api/sets/card/{card_set_id}/"
+    try:
+        with request.urlopen(url, timeout=10) as response:
+            payload = json.load(response)
+    except Exception:
+        return None
+
+    if isinstance(payload, list):
+        return payload[0] if payload else None
+    if isinstance(payload, dict):
+        return payload
+    return None
 
 
 class OpenCVCapture:
@@ -358,7 +381,8 @@ def main():
             if db:
                 removed = db.pop()
                 atomic_write_json(out_path, db)
-                flash_text = f"UNDO: {removed}"
+                removed_code = removed.get("code") if isinstance(removed, dict) else str(removed)
+                flash_text = f"UNDO: {removed_code}"
                 flash_ok = True
                 flash_until = time.time() + 1.0
 
@@ -412,7 +436,8 @@ def main():
                 code = None
 
             if code:
-                db.append(code)
+                card_payload = fetch_card_info(code)
+                db.append({"code": code, "card": card_payload})
                 atomic_write_json(out_path, db)
                 flash_text = code
                 flash_ok = True
