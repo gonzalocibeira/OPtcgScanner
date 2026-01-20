@@ -11,17 +11,22 @@ Install:
   python3 -m venv .venv
   source .venv/bin/activate
   python -m pip install --upgrade pip setuptools wheel
-  python -m pip install opencv-python pyobjc pyobjc-framework-Vision pyobjc-framework-Quartz
+  python -m pip install opencv-python pyobjc pyobjc-framework-Vision pyobjc-framework-Quartz pyobjc-framework-AVFoundation
 
 Run:
   python op_tcg_scanner.py --camera 0 --out cards.json
   (try --camera 1,2... if using iPhone Continuity Camera)
+  python op_tcg_scanner.py --backend avfoundation --focus-mode continuous --zoom 1.5
 """
 
 import argparse
+import ctypes
+import importlib
+import importlib.util
 import json
 import os
 import re
+import threading
 import time
 from pathlib import Path
 
@@ -171,24 +176,200 @@ def mild_preprocess(roi_bgr: np.ndarray) -> np.ndarray:
     return out
 
 
+class OpenCVCapture:
+    def __init__(self, camera_index: int, width: int, height: int):
+        self.cap = cv2.VideoCapture(camera_index)
+        if not self.cap.isOpened():
+            raise SystemExit(f"Could not open camera index {camera_index}. Try --camera 1 or 2.")
+        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
+        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+
+    def read(self):
+        return self.cap.read()
+
+    def release(self):
+        self.cap.release()
+
+
+def load_avfoundation_modules():
+    modules = {}
+    for name in ("AVFoundation", "CoreMedia", "CoreVideo", "Foundation", "dispatch", "objc"):
+        if importlib.util.find_spec(name) is None:
+            return None
+        modules[name] = importlib.import_module(name)
+    return modules
+
+
+def build_avfoundation_delegate(modules):
+    Foundation = modules["Foundation"]
+    CoreMedia = modules["CoreMedia"]
+    CoreVideo = modules["CoreVideo"]
+    objc = modules["objc"]
+
+    class AVFoundationFrameDelegate(Foundation.NSObject):
+        def init(self):
+            self = objc.super(AVFoundationFrameDelegate, self).init()
+            if self is None:
+                return None
+            self.latest_frame = None
+            self.lock = threading.Lock()
+            self.frame_event = threading.Event()
+            return self
+
+        def captureOutput_didOutputSampleBuffer_fromConnection_(
+            self, _output, sampleBuffer, _connection
+        ):
+            image_buffer = CoreMedia.CMSampleBufferGetImageBuffer(sampleBuffer)
+            if image_buffer is None:
+                return
+            CoreVideo.CVPixelBufferLockBaseAddress(image_buffer, 0)
+            try:
+                width = CoreVideo.CVPixelBufferGetWidth(image_buffer)
+                height = CoreVideo.CVPixelBufferGetHeight(image_buffer)
+                bytes_per_row = CoreVideo.CVPixelBufferGetBytesPerRow(image_buffer)
+                base_addr = CoreVideo.CVPixelBufferGetBaseAddress(image_buffer)
+                if base_addr is None:
+                    return
+                data = ctypes.string_at(base_addr, bytes_per_row * height)
+                frame = np.frombuffer(data, dtype=np.uint8)
+                frame = frame.reshape((height, bytes_per_row // 4, 4))
+                frame = frame[:, :width, :]
+                bgr = cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
+                with self.lock:
+                    self.latest_frame = bgr
+                    self.frame_event.set()
+            finally:
+                CoreVideo.CVPixelBufferUnlockBaseAddress(image_buffer, 0)
+
+    return AVFoundationFrameDelegate
+
+
+class AVFoundationCapture:
+    def __init__(self, camera_index: int, width: int, height: int, focus_mode: str, zoom: float):
+        modules = load_avfoundation_modules()
+        if modules is None:
+            raise RuntimeError("AVFoundation modules unavailable")
+
+        self.modules = modules
+        AVFoundation = modules["AVFoundation"]
+        CoreVideo = modules["CoreVideo"]
+        dispatch = modules["dispatch"]
+
+        devices = AVFoundation.AVCaptureDevice.devicesWithMediaType_(
+            AVFoundation.AVMediaTypeVideo
+        )
+        if not devices or camera_index >= len(devices):
+            raise RuntimeError(f"No AVFoundation camera for index {camera_index}")
+        self.device = devices[camera_index]
+
+        self.session = AVFoundation.AVCaptureSession.alloc().init()
+        if width >= 1280 or height >= 720:
+            self.session.setSessionPreset_(AVFoundation.AVCaptureSessionPreset1280x720)
+        else:
+            self.session.setSessionPreset_(AVFoundation.AVCaptureSessionPreset640x480)
+
+        input_device, err = AVFoundation.AVCaptureDeviceInput.deviceInputWithDevice_error_(
+            self.device, None
+        )
+        if err is not None:
+            raise RuntimeError(f"Failed to create AVFoundation input: {err}")
+        if self.session.canAddInput_(input_device):
+            self.session.addInput_(input_device)
+
+        self.output = AVFoundation.AVCaptureVideoDataOutput.alloc().init()
+        settings = {
+            CoreVideo.kCVPixelBufferPixelFormatTypeKey: CoreVideo.kCVPixelFormatType_32BGRA
+        }
+        self.output.setVideoSettings_(settings)
+        self.output.setAlwaysDiscardsLateVideoFrames_(True)
+
+        delegate_cls = build_avfoundation_delegate(modules)
+        self.delegate = delegate_cls.alloc().init()
+        self.queue = dispatch.dispatch_queue_create(
+            "op_tcg_scanner.avfoundation", dispatch.DISPATCH_QUEUE_SERIAL
+        )
+        self.output.setSampleBufferDelegate_queue_(self.delegate, self.queue)
+        if self.session.canAddOutput_(self.output):
+            self.session.addOutput_(self.output)
+
+        self.configure_device(focus_mode, zoom)
+        self.session.startRunning()
+
+    def configure_device(self, focus_mode: str, zoom: float):
+        AVFoundation = self.modules["AVFoundation"]
+        if not self.device.lockForConfiguration_(None):
+            return
+        try:
+            focus_map = {
+                "auto": AVFoundation.AVCaptureFocusModeAutoFocus,
+                "continuous": AVFoundation.AVCaptureFocusModeContinuousAutoFocus,
+                "locked": AVFoundation.AVCaptureFocusModeLocked,
+            }
+            mode = focus_map.get(focus_mode)
+            if mode is not None and self.device.isFocusModeSupported_(mode):
+                self.device.setFocusMode_(mode)
+
+            if zoom and zoom > 1.0:
+                max_zoom = float(self.device.activeFormat().videoMaxZoomFactor())
+                clamped = max(1.0, min(float(zoom), max_zoom))
+                self.device.setVideoZoomFactor_(clamped)
+        finally:
+            self.device.unlockForConfiguration()
+
+    def read(self):
+        if not self.delegate.frame_event.wait(1.0):
+            return False, None
+        with self.delegate.lock:
+            frame = None if self.delegate.latest_frame is None else self.delegate.latest_frame.copy()
+            self.delegate.frame_event.clear()
+        return (frame is not None), frame
+
+    def release(self):
+        self.session.stopRunning()
+
+
+def create_capture(args):
+    if args.backend == "avfoundation":
+        try:
+            return AVFoundationCapture(
+                args.camera, args.width, args.height, args.focus_mode, args.zoom
+            )
+        except RuntimeError as exc:
+            print(f"AVFoundation backend unavailable: {exc}. Falling back to OpenCV.")
+    return OpenCVCapture(args.camera, args.width, args.height)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--camera", type=int, default=0, help="Camera index (0,1,2...)")
     ap.add_argument("--out", type=str, default="cards.json", help="Output JSON path")
     ap.add_argument("--width", type=int, default=1280, help="Requested capture width")
     ap.add_argument("--height", type=int, default=720, help="Requested capture height")
+    ap.add_argument(
+        "--backend",
+        choices=("opencv", "avfoundation"),
+        default="opencv",
+        help="Capture backend (avfoundation uses PyObjC on macOS)",
+    )
+    ap.add_argument(
+        "--focus-mode",
+        choices=("none", "auto", "continuous", "locked"),
+        default="none",
+        help="AVFoundation focus mode",
+    )
+    ap.add_argument(
+        "--zoom",
+        type=float,
+        default=1.0,
+        help="AVFoundation zoom factor (1.0 = no zoom)",
+    )
     ap.add_argument("--preprocess", action="store_true", help="Enable mild preprocessing before OCR")
     args = ap.parse_args()
 
     out_path = Path(args.out)
     db = load_db(out_path)
 
-    cap = cv2.VideoCapture(args.camera)
-    if not cap.isOpened():
-        raise SystemExit(f"Could not open camera index {args.camera}. Try --camera 1 or 2.")
-
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, args.width)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, args.height)
+    capture = create_capture(args)
 
     win = "OP TCG Scanner (Space/Enter=Scan, D=Undo, Q/Esc=Quit)"
     cv2.namedWindow(win, cv2.WINDOW_NORMAL)
@@ -200,7 +381,7 @@ def main():
     last_scan_time = 0.0
 
     while True:
-        ok, frame = cap.read()
+        ok, frame = capture.read()
         if not ok or frame is None:
             continue
 
@@ -298,7 +479,7 @@ def main():
                 flash_ok = False
                 flash_until = time.time() + 1.0
 
-    cap.release()
+    capture.release()
     cv2.destroyAllWindows()
 
 
