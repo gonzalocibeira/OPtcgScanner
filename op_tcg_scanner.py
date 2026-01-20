@@ -16,6 +16,7 @@ Install:
 Run:
   python op_tcg_scanner.py --camera 0 --out cards.json
   (try --camera 1,2... if using iPhone Continuity Camera)
+  python op_tcg_scanner.py --debug --debug-log debug_scans.log
 """
 
 import argparse
@@ -60,6 +61,13 @@ def atomic_write_json(path: Path, data):
     with tmp.open("w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
     os.replace(tmp, path)
+
+
+def append_debug_log(path: Path, payload: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False)
+        f.write("\n")
 
 
 def load_db(path: Path):
@@ -182,21 +190,32 @@ def vision_ocr_text(bgr_img: np.ndarray) -> str:
 
 
 def extract_code(text: str) -> str | None:
-    if not text:
-        return None
+    normalized = normalize_text(text)
+    return extract_code_from_normalized(normalized)
 
-    t = text.upper()
+
+def normalize_text(text: str) -> str:
+    if not text:
+        return ""
+
+    normalized = text.upper()
 
     # Normalize dash variants globally before any targeted fixes.
-    t = re.sub(r"[‐‑‒–—―−]", "-", t)
+    normalized = re.sub(r"[‐‑‒–—―−]", "-", normalized)
     # Replace separator noise (spaces, underscores, punctuation) with dashes.
-    t = re.sub(r"[\s_]+", "-", t)
-    t = re.sub(r"[^A-Z0-9-]+", "-", t)
+    normalized = re.sub(r"[\s_]+", "-", normalized)
+    normalized = re.sub(r"[^A-Z0-9-]+", "-", normalized)
 
     # Common OCR fixes after dash normalization.
-    t = t.replace("0P", "OP")  # 0P -> OP
+    normalized = normalized.replace("0P", "OP")  # 0P -> OP
+    return normalized
 
-    m = CODE_REGEX.search(t)
+
+def extract_code_from_normalized(normalized: str) -> str | None:
+    if not normalized:
+        return None
+
+    m = CODE_REGEX.search(normalized)
     return m.group(1) if m else None
 
 
@@ -269,10 +288,22 @@ def main():
         help="ROI in pixels x,y,w,h. Overrides --roi and default guide box.",
     )
     ap.add_argument("--preprocess", action="store_true", help="Enable mild preprocessing before OCR")
+    ap.add_argument(
+        "--debug",
+        action="store_true",
+        help="Enable debug logging for failed scans (no valid code found).",
+    )
+    ap.add_argument(
+        "--debug-log",
+        type=str,
+        default="debug_scans.log",
+        help="Debug log path (used with --debug).",
+    )
     args = ap.parse_args()
 
     out_path = Path(args.out)
     db = load_db(out_path)
+    debug_log_path = Path(args.debug_log)
 
     capture = OpenCVCapture(args.camera, args.width, args.height)
 
@@ -430,11 +461,16 @@ def main():
             roi = frame[y:y + rh, x:x + rw].copy()
             img_for_ocr = mild_preprocess(roi) if args.preprocess else roi
 
+            text = ""
+            normalized_text = ""
+            code = None
+            error_message = None
             try:
                 text = vision_ocr_text(img_for_ocr)
-                code = extract_code(text)
-            except Exception:
-                code = None
+                normalized_text = normalize_text(text)
+                code = extract_code_from_normalized(normalized_text)
+            except Exception as exc:
+                error_message = f"{type(exc).__name__}: {exc}"
 
             if code:
                 card_payload = fetch_card_info(code)
@@ -449,6 +485,20 @@ def main():
                 flash_text = f"No code ({short})"
                 flash_ok = False
                 flash_until = time.time() + 1.0
+                if args.debug:
+                    append_debug_log(
+                        debug_log_path,
+                        {
+                            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+                            "ocr_text": text,
+                            "normalized_text": normalized_text,
+                            "regex": CODE_REGEX.pattern,
+                            "roi_px": [x, y, rw, rh],
+                            "roi_rel": [roi_rel_state[0], roi_rel_state[1], roi_rel_state[2], roi_rel_state[3]],
+                            "preprocess": args.preprocess,
+                            "error": error_message,
+                        },
+                    )
 
     capture.release()
     cv2.destroyAllWindows()
