@@ -291,6 +291,53 @@ def fetch_card_info(code: str) -> dict | None:
     return None
 
 
+def get_card_image_url(card_payload: dict | None) -> str | None:
+    if not isinstance(card_payload, dict):
+        return None
+    return card_payload.get("card_image") or card_payload.get("card_image_url")
+
+
+def fetch_card_image(url: str) -> np.ndarray | None:
+    try:
+        with request.urlopen(url, timeout=10) as response:
+            data = response.read()
+    except Exception:
+        return None
+
+    image_array = np.frombuffer(data, dtype=np.uint8)
+    if image_array.size == 0:
+        return None
+    image = cv2.imdecode(image_array, cv2.IMREAD_COLOR)
+    return image
+
+
+def resize_card_image(image: np.ndarray, max_width: int, max_height: int) -> np.ndarray | None:
+    if image is None:
+        return None
+    h, w = image.shape[:2]
+    if h == 0 or w == 0:
+        return None
+    scale = min(max_width / w, max_height / h, 1.0)
+    new_w = max(1, int(w * scale))
+    new_h = max(1, int(h * scale))
+    return cv2.resize(image, (new_w, new_h), interpolation=cv2.INTER_AREA)
+
+
+def overlay_image(frame: np.ndarray, image: np.ndarray, top_left: tuple[int, int]) -> None:
+    frame_h, frame_w = frame.shape[:2]
+    img_h, img_w = image.shape[:2]
+    x, y = top_left
+    if x >= frame_w or y >= frame_h:
+        return
+    x_end = min(frame_w, x + img_w)
+    y_end = min(frame_h, y + img_h)
+    if x_end <= x or y_end <= y:
+        return
+    frame_slice = frame[y:y_end, x:x_end]
+    image_slice = image[: y_end - y, : x_end - x]
+    frame_slice[:] = image_slice
+
+
 def get_text_size(text: str, font, scale: float, thickness: int) -> tuple[int, int, int]:
     (text_w, text_h), baseline = cv2.getTextSize(text, font, scale, thickness)
     return text_w, text_h, baseline
@@ -380,6 +427,9 @@ def main():
     flash_until = 0.0
     flash_text = ""
     flash_ok = False
+    flash_image = None
+    flash_image_until = 0.0
+    image_cache: dict[str, np.ndarray] = {}
 
     last_scan_time = 0.0
     roi_rel_state = args.roi if args.roi is not None else ROI_REL
@@ -519,6 +569,14 @@ def main():
                 2,
                 cv2.LINE_AA
             )
+            if flash_ok and flash_image is not None and now < flash_image_until:
+                max_img_w = max(120, int(w * 0.18))
+                max_img_h = max(160, int(h * 0.3))
+                resized = resize_card_image(flash_image, max_img_w, max_img_h)
+                if resized is not None:
+                    image_x = 20
+                    image_y = 165
+                    overlay_image(frame, resized, (image_x, image_y))
 
         cv2.imshow(win, frame)
         key = cv2.waitKey(1) & 0xFF
@@ -615,17 +673,30 @@ def main():
                     entry = {"code": code, "card": card_payload, "quantity": 1}
                     db.append(entry)
                     db_by_code[code] = entry
+                image_url = get_card_image_url(card_payload) or get_card_image_url(entry.get("card"))
+                flash_image = None
+                if image_url:
+                    if image_url in image_cache:
+                        flash_image = image_cache[image_url]
+                    else:
+                        fetched_image = fetch_card_image(image_url)
+                        if fetched_image is not None:
+                            image_cache[image_url] = fetched_image
+                            flash_image = fetched_image
                 scan_history.append(code)
                 atomic_write_json(out_path, db)
                 flash_text = code
                 flash_ok = True
-                flash_until = time.time() + 1.0
+                flash_until = time.time() + 1.5
+                flash_image_until = flash_until
             else:
                 # Useful hint: show what Vision saw (short)
                 short = (text.replace("\n", " ")[:40] + "...") if text else "No text"
                 flash_text = f"No code ({short})"
                 flash_ok = False
                 flash_until = time.time() + 1.0
+                flash_image = None
+                flash_image_until = 0.0
                 if args.debug:
                     append_debug_log(
                         debug_log_path,
