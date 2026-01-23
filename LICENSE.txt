@@ -1,5 +1,5 @@
 Proprietary License
-Copyright (c) 2025 Gonzalo Cibeira. All rights reserved.
+Copyright (c) 2026 Gonzalo Cibeira. All rights reserved.
 
 You are granted a personal, non-transferable license to use this software for non-commercial and non-corporate purposes only.
 
